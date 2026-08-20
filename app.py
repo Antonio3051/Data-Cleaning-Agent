@@ -194,7 +194,7 @@ def render_plan_review(state: dict[str, Any]) -> None:
                 }
             )
 
-    if st.button("Apply approved actions", type="primary"):
+    if st.button("Apply and Continue", type="primary"):
         resume_run(decisions)
         st.rerun()
 
