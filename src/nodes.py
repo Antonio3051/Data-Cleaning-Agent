@@ -236,7 +236,7 @@ def _fallback_plan(report: list[dict[str, Any]]) -> list[PlanStepModel]:
         elif stats.get("kind") == "numeric":
             if mechanism == "MAR":
                 action, params = "impute_knn", {"n_neighbors": 5}
-            elif abs(stats.get("skew", 0.0)) >= 0.5 or stats.get("outlier_count", 0) > 0:
+            elif abs(stats.get("skew", 0.0)) >= 0.5 or stats.get("outlier_count", 0) > 0.01 * max(entry["n_unique"], 1):
                 action, params = "impute_median", {}
             else:
                 action, params = "impute_mean", {}
