@@ -16,8 +16,8 @@ from typing import Any, Literal
 import pandas as pd
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field, field_validator
 
 from . import tools
 from .graph import CleaningState
@@ -25,12 +25,12 @@ from .graph import CleaningState
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Model configuration - GLM only
+# Model configuration - Gemini only
 # --------------------------------------------------------------------------- #
-GLM_MODEL = os.getenv("GLM_MODEL", "glm-5.2")
-GLM_BASE_URL = os.getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4")
-GLM_API_KEY_ENV = "GLM_API_KEY"
-GLM_TEMPERATURE = float(os.getenv("GLM_TEMPERATURE", "0.1"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+# Some Gemini models use fixed sampling defaults and reject/ignore temperature, so only send it when asked.
+GEMINI_TEMPERATURE = os.getenv("GEMINI_TEMPERATURE")
 
 ImputationAction = Literal[
     "impute_mean",
@@ -51,11 +51,24 @@ class PlanStepModel(BaseModel):
     action: ImputationAction = Field(description="The cleaning action to apply to this column.")
     params: dict[str, Any] = Field(
         default_factory=dict,
-        description="Action arguments, e.g. {'n_neighbors': 5} for impute_knn or {'value': 'Unknown'} for fill_constant.",
+        description="JSON object of action arguments, e.g. {'n_neighbors': 5} for impute_knn or "
+        "{'value': 'Unknown'} for fill_constant. Use an empty object when the action takes no arguments.",
     )
     rationale: str = Field(description="Why this action, citing missing %, skew, outliers and mechanism.")
     confidence: Literal["low", "medium", "high"] = Field(description="How strongly the evidence supports this action.")
     risk: str = Field(default="", description="What this action could distort, e.g. variance shrinkage or lost rows.")
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def _parse_params(cls, value: Any) -> dict[str, Any]:
+        """Gemini serializes open-ended objects as JSON strings, so decode them."""
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value or "{}")
+            except json.JSONDecodeError:
+                return {}
+            return decoded if isinstance(decoded, dict) else {}
+        return value or {}
 
 
 class CleaningPlanModel(BaseModel):
@@ -90,24 +103,20 @@ column, mechanism). State the risk of the action you chose. Be concise: at most 
 
 
 def get_llm(**overrides: Any) -> BaseChatModel:
-    """Return the GLM chat client. This project is configured strictly for GLM.
-
-    The endpoint is OpenAI-compatible, so ``ChatOpenAI`` is used purely as the
-    HTTP client; ``model`` and ``base_url`` always point at GLM.
-    """
-    api_key = os.getenv(GLM_API_KEY_ENV) or os.getenv("ZHIPUAI_API_KEY")
+    """Return the Gemini chat client. This project is configured strictly for Gemini."""
+    api_key = os.getenv(GEMINI_API_KEY_ENV) or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise RuntimeError(f"Missing GLM credentials: set the {GLM_API_KEY_ENV} environment variable.")
+        raise RuntimeError(f"Missing Gemini credentials: set the {GEMINI_API_KEY_ENV} environment variable.")
     params: dict[str, Any] = {
-        "model": GLM_MODEL,
-        "base_url": GLM_BASE_URL,
-        "api_key": api_key,
-        "temperature": GLM_TEMPERATURE,
+        "model": GEMINI_MODEL,
+        "google_api_key": api_key,
         "timeout": 120,
         "max_retries": 2,
     }
+    if GEMINI_TEMPERATURE is not None:
+        params["temperature"] = float(GEMINI_TEMPERATURE)
     params.update(overrides)
-    return ChatOpenAI(**params)
+    return ChatGoogleGenerativeAI(**params)
 
 
 # --------------------------------------------------------------------------- #
@@ -147,7 +156,7 @@ def profile_node(state: CleaningState) -> dict[str, Any]:
 
 
 def plan_node(state: CleaningState) -> dict[str, Any]:
-    """Reasoning node: GLM turns the missing-values report into a justified plan."""
+    """Reasoning node: Gemini turns the missing-values report into a justified plan."""
     report = [entry for entry in state["missing_report"] if entry["missing_count"] > 0]
     if not report:
         return {"plan": [], "plan_summary": "No missing values detected; nothing to impute or drop."}
@@ -158,10 +167,10 @@ def plan_node(state: CleaningState) -> dict[str, Any]:
         llm = get_llm().with_structured_output(CleaningPlanModel, method="function_calling")
         result = llm.invoke(messages)
     except Exception:  # never lose the run because of a model/transport error
-        logger.exception("GLM planning call failed; falling back to deterministic rules.")
+        logger.exception("Gemini planning call failed; falling back to deterministic rules.")
         return {
             "plan": [_to_plan_step(s) for s in _fallback_plan(report)],
-            "plan_summary": "GLM was unavailable; this plan comes from the deterministic rule set.",
+            "plan_summary": "Gemini was unavailable; this plan comes from the deterministic rule set.",
             "plan_source": "fallback",
             "awaiting_user": True,
         }
@@ -172,7 +181,7 @@ def plan_node(state: CleaningState) -> dict[str, Any]:
     return {
         "plan": steps,
         "plan_summary": result.overall_summary,
-        "plan_source": f"glm:{GLM_MODEL}",
+        "plan_source": f"gemini:{GEMINI_MODEL}",
         "awaiting_user": True,
     }
 
@@ -209,7 +218,7 @@ def _render_report(state: CleaningState, report: list[dict[str, Any]]) -> str:
 def _column_exists(column: str, df: pd.DataFrame) -> bool:
     if column in df.columns:
         return True
-    logger.warning("GLM proposed a step for unknown column %r; discarding it.", column)
+    logger.warning("The model proposed a step for unknown column %r; discarding it.", column)
     return False
 
 

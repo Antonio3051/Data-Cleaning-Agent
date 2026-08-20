@@ -272,7 +272,8 @@ def missingness_correlation(df: pd.DataFrame, column: str) -> dict[str, float]:
         candidate = series.astype(float) if ptypes.is_numeric_dtype(series) else series.isna().astype(float)
         if candidate.nunique(dropna=True) < 2:
             continue
-        r = indicator.corr(candidate)
+        with np.errstate(invalid="ignore", divide="ignore"):  # zero-variance overlap yields NaN, which we drop below
+            r = indicator.corr(candidate)
         if pd.notna(r) and abs(r) >= 0.05:
             out[other] = round(float(r), 3)
     return dict(sorted(out.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5])
