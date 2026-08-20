@@ -151,7 +151,7 @@ def _to_numeric_series(s: pd.Series) -> pd.Series:
     """Parse a text series into numbers, handling currency symbols and both decimal conventions."""
     txt = _normalize_null_tokens(s)
     txt = txt.mask(txt.str.match(_DATE_LIKE))  # never read 03/15/2021 as the number 3152021
-    txt = txt.str.replace(r"[\s\u00a0]", "", regex=True)
+    txt = txt.str.replace(r"[\s\x00a0]", "", regex=True)
     txt = txt.str.replace(r"^\((.*)\)$", r"-\1", regex=True)  # (1 234) -> -1234
     txt = txt.mask(txt.str.contains(_ALPHA_NOISE))  # 'A1' is a code, not the number 1
     txt = txt.str.replace(_CURRENCY_NOISE, "", regex=True)
