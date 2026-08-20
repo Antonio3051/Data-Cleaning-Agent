@@ -24,6 +24,8 @@ Severity = Literal["none", "low", "medium", "high", "critical"]
 _THOUSANDS_DOT = re.compile(r"^-?\d{1,3}(\.\d{3})+(,\d+)?$")
 _THOUSANDS_COMMA = re.compile(r"^-?\d{1,3}(,\d{3})+(\.\d+)?$")
 _CURRENCY_NOISE = re.compile(r"[^\d,.\-+eE]")
+# Letters other than the exponent 'e' mean the value is a code or a label, not a number.
+_ALPHA_NOISE = re.compile(r"[A-DF-Za-df-z]")
 _NULL_TOKENS = {"", "na", "n/a", "n.a.", "nan", "null", "none", "nil", "-", "--", "?", "unknown", "missing"}
 
 _DATE_PATTERNS: tuple[tuple[re.Pattern[str], str, bool], ...] = (
@@ -95,12 +97,63 @@ def strip_whitespace(df: pd.DataFrame, columns: list[str] | None = None) -> tupl
     return out, f"Stripped/normalized whitespace on {len(touched)} column(s): {touched}."
 
 
+def _case_rank(value: str) -> int:
+    """Rank spellings when variants are equally frequent: Title case reads best, SHOUTING worst."""
+    if value.istitle():
+        return 0
+    if value.isupper():
+        return 2
+    if value.islower():
+        return 1
+    return 0
+
+
+def unify_case(df: pd.DataFrame, columns: list[str] | None = None, max_unique: int = 200) -> tuple[pd.DataFrame, str]:
+    """Collapse case variants of the same category onto their most frequent spelling.
+
+    ``New York`` / ``new york`` / ``NEW YORK`` all become ``New York`` (the modal
+    spelling), so they stop competing as separate categories in counts and mode
+    imputation. Values without a case-variant twin are left exactly as written,
+    and high-cardinality columns (free text, ids) are skipped.
+    """
+    out = df.copy()
+    targets = columns or [c for c in out.columns if ptypes.is_object_dtype(out[c]) or ptypes.is_string_dtype(out[c])]
+    touched: dict[str, int] = {}
+    for col in targets:
+        if col not in out.columns:
+            continue
+        series = out[col].astype("string")
+        non_null = series.dropna()
+        if non_null.empty or non_null.nunique() > max_unique:
+            continue
+        folded = non_null.str.casefold()
+        # The winning spelling per case-insensitive group: most frequent, then the best-looking
+        # variant (Title case over ALL CAPS or all lower), then alphabetical for full determinism.
+        counts = pd.DataFrame({"folded": folded, "value": non_null}).value_counts(["folded", "value"]).reset_index(name="n")
+        counts["shape_rank"] = counts["value"].map(_case_rank)
+        canonical = (
+            counts.sort_values(["folded", "n", "shape_rank", "value"], ascending=[True, False, True, True])
+            .drop_duplicates("folded")
+            .set_index("folded")["value"]
+        )
+        mapped = series.str.casefold().map(canonical).astype("string")
+        changed = int((mapped.fillna("") != series.fillna("")).sum())
+        if changed:
+            touched[col] = changed
+            out[col] = mapped
+    if not touched:
+        return out, "No case-variant categories found."
+    detail = ", ".join(f"{col} ({n})" for col, n in touched.items())
+    return out, f"Unified letter case on {len(touched)} column(s): {detail}."
+
+
 def _to_numeric_series(s: pd.Series) -> pd.Series:
     """Parse a text series into numbers, handling currency symbols and both decimal conventions."""
     txt = _normalize_null_tokens(s)
     txt = txt.mask(txt.str.match(_DATE_LIKE))  # never read 03/15/2021 as the number 3152021
     txt = txt.str.replace(r"[\s\u00a0]", "", regex=True)
     txt = txt.str.replace(r"^\((.*)\)$", r"-\1", regex=True)  # (1 234) -> -1234
+    txt = txt.mask(txt.str.contains(_ALPHA_NOISE))  # 'A1' is a code, not the number 1
     txt = txt.str.replace(_CURRENCY_NOISE, "", regex=True)
 
     sample = txt.dropna()
@@ -510,6 +563,7 @@ def keep_as_is(df: pd.DataFrame, column: str) -> tuple[pd.DataFrame, str]:
 ACTION_REGISTRY: dict[str, Callable[..., tuple[pd.DataFrame, str]]] = {
     "drop_duplicates": drop_duplicate_rows,
     "strip_whitespace": strip_whitespace,
+    "unify_case": unify_case,
     "convert_numeric": convert_to_numeric,
     "clean_dates": clean_dates,
     "impute_mean": impute_mean,
