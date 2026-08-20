@@ -134,6 +134,8 @@ def ingest_node(state: CleaningState) -> dict[str, Any]:
     df.columns = [str(c).strip() for c in df.columns]
     df, msg = tools.strip_whitespace(df)
     log.append(msg)
+    df, msg = tools.unify_case(df)
+    log.append(msg)
 
     for col in df.columns:
         info = tools.detect_column_type(df[col])
