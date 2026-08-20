@@ -43,6 +43,10 @@ ImputationAction = Literal[
     "keep_as_is",
 ]
 
+# Actions that operate on the whole table instead of a single column.
+ROW_SCOPE = "<all rows>"
+TABLE_ACTIONS = frozenset({"drop_duplicates"})
+
 
 class PlanStepModel(BaseModel):
     """One justified decision for one column."""
@@ -158,8 +162,14 @@ def profile_node(state: CleaningState) -> dict[str, Any]:
 def plan_node(state: CleaningState) -> dict[str, Any]:
     """Reasoning node: Gemini turns the missing-values report into a justified plan."""
     report = [entry for entry in state["missing_report"] if entry["missing_count"] > 0]
+    dedup = _duplicate_step(state)
     if not report:
-        return {"plan": [], "plan_summary": "No missing values detected; nothing to impute or drop."}
+        return {
+            "plan": dedup,
+            "plan_summary": "No missing values detected." + (" Duplicate rows are still pending." if dedup else ""),
+            "plan_source": "deterministic",
+            "awaiting_user": bool(dedup),
+        }
 
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_render_report(state, report))]
 
@@ -169,7 +179,7 @@ def plan_node(state: CleaningState) -> dict[str, Any]:
     except Exception:  # never lose the run because of a model/transport error
         logger.exception("Gemini planning call failed; falling back to deterministic rules.")
         return {
-            "plan": [_to_plan_step(s) for s in _fallback_plan(report)],
+            "plan": dedup + [_to_plan_step(s) for s in _fallback_plan(report)],
             "plan_summary": "Gemini was unavailable; this plan comes from the deterministic rule set.",
             "plan_source": "fallback",
             "awaiting_user": True,
@@ -179,11 +189,29 @@ def plan_node(state: CleaningState) -> dict[str, Any]:
     covered = {step["column"] for step in steps}
     steps += [_to_plan_step(s) for s in _fallback_plan(report) if s.column not in covered]
     return {
-        "plan": steps,
+        "plan": dedup + steps,
         "plan_summary": result.overall_summary,
         "plan_source": f"gemini:{GEMINI_MODEL}",
         "awaiting_user": True,
     }
+
+
+def _duplicate_step(state: CleaningState) -> list[dict[str, Any]]:
+    """Deduplication is clear-cut, so it is proposed by rule rather than by the model."""
+    duplicates = int(state.get("duplicate_report", {}).get("duplicate_rows", 0))
+    if duplicates <= 0:
+        return []
+    return [
+        {
+            "step_id": f"duplicates:{uuid.uuid4().hex[:6]}",
+            "column": ROW_SCOPE,
+            "action": "drop_duplicates",
+            "params": {},
+            "rationale": f"{duplicates} fully identical row(s) detected; they bias every statistic downstream.",
+            "confidence": "high",
+            "risk": "Legitimate repeated observations are lost if the rows are not true duplicates.",
+        }
+    ]
 
 
 def _render_report(state: CleaningState, report: list[dict[str, Any]]) -> str:
@@ -269,15 +297,60 @@ def _fallback_plan(report: list[dict[str, Any]]) -> list[PlanStepModel]:
 
 
 def human_review_node(state: CleaningState) -> dict[str, Any]:
-    """Interrupt point. Marks the state as awaiting user approval of ``plan``."""
-    raise NotImplementedError
+    """Interrupt point: the graph is compiled to stop *after* this node.
+
+    The UI resumes the run once it has written ``decisions`` into the state.
+    """
+    return {"awaiting_user": True}
 
 
 def apply_decisions_node(state: CleaningState) -> dict[str, Any]:
-    """Execute approved steps via ``tools.ACTION_REGISTRY`` -> new ``current_df`` + log."""
-    raise NotImplementedError
+    """Execute the approved steps, in order, against ``current_df``."""
+    df = state["current_df"]
+    decisions = {d["step_id"]: d for d in state.get("decisions", [])}
+    log: list[str] = []
+
+    for step in state.get("plan", []):
+        decision = decisions.get(step["step_id"])
+        if decision is None or not decision["approved"]:
+            log.append(f"Skipped '{step['column']}': {step['action']} not approved.")
+            continue
+
+        action = decision.get("override_action") or step["action"]
+        params = decision.get("override_params")
+        if params is None:
+            params = step["params"]
+        func = tools.ACTION_REGISTRY.get(action)
+        if func is None:
+            log.append(f"Skipped '{step['column']}': unknown action {action!r}.")
+            continue
+        table_scope = action in TABLE_ACTIONS
+        if not table_scope and step["column"] not in df.columns:
+            log.append(f"Skipped '{step['column']}': column no longer present.")
+            continue
+
+        try:
+            df, message = func(df, **params) if table_scope else func(df, step["column"], **params)
+        except Exception as exc:  # a bad param must not kill the whole run
+            logger.exception("Action %s failed on column %s", action, step["column"])
+            log.append(f"Failed '{step['column']}' ({action}): {exc}")
+            continue
+        log.append(message)
+
+    return {"current_df": df, "applied_log": log, "decisions": [], "plan": [], "awaiting_user": False, "passes": state.get("passes", 0) + 1}
 
 
 def report_node(state: CleaningState) -> dict[str, Any]:
-    """Before/after diff summary for the UI and the downloadable cleaned CSV."""
-    raise NotImplementedError
+    """Before/after diff for the UI, computed from ``original_df`` vs ``current_df``."""
+    before, after = state["original_df"], state["current_df"]
+    summary = {
+        "rows_before": len(before),
+        "rows_after": len(after),
+        "columns_before": int(before.shape[1]),
+        "columns_after": int(after.shape[1]),
+        "dropped_columns": [str(c) for c in before.columns if c not in after.columns],
+        "missing_before": int(before.isna().sum().sum()),
+        "missing_after": int(after.isna().sum().sum()),
+        "dtypes_after": {str(c): str(t) for c, t in after.dtypes.items()},
+    }
+    return {"final_report": summary, "missing_report": tools.analyze_missing_values(after), "awaiting_user": False}
