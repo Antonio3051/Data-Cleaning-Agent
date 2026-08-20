@@ -1,0 +1,10 @@
+langgraph>=0.2.60
+langchain-core>=0.3.28
+langchain-openai>=0.2.14
+pandas>=2.2.3
+numpy>=2.1.3
+scikit-learn>=1.6.0
+streamlit>=1.41.1
+openpyxl>=3.1.5
+pydantic>=2.10.4
+python-dotenv>=1.0.1
